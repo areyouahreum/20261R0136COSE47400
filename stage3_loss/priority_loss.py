@@ -83,6 +83,12 @@ class PriorityWeightedLoss(nn.Module):
         lambda_natural:   weight for the naturalness (L1) term.
         lambda_adv:       weight for the adversarial term (0 until discriminator
                           is connected).
+        lambda_contrast:  weight for the CVD-CONTRAST term (NEW). This is the
+                          term that actually pushes high-priority regions to be
+                          MORE distinguishable from their surroundings *as seen
+                          through CVD eyes* — the perceptual term alone only
+                          preserves content, it does not increase separation.
+                          Set to 0.0 to recover the original two-term behavior.
         in01:             True if images are in [0,1]; False for [-1,1] (default).
         layer_weights:    per-VGG-layer weights for the perceptual term
                           (paper used 0.66 / 0.34 for relu1_2 / relu2_2).
@@ -100,8 +106,10 @@ class PriorityWeightedLoss(nn.Module):
         lambda_distinct=1.0,
         lambda_natural=1.0,
         lambda_adv=0.0,
+        lambda_contrast=1.0,
         in01=False,
         layer_weights=(0.66, 0.34),
+        contrast_blur_kernel=15,
     ):
         super().__init__()
         self.cvd_sim = cvd_sim
@@ -109,8 +117,10 @@ class PriorityWeightedLoss(nn.Module):
         self.lambda_distinct = lambda_distinct
         self.lambda_natural = lambda_natural
         self.lambda_adv = lambda_adv
+        self.lambda_contrast = lambda_contrast
         self.in01 = in01
         self.layer_weights = layer_weights
+        self.contrast_blur_kernel = contrast_blur_kernel
 
     def distinguishability_term(self, recolored, original, priority):
         """Priority-weighted perceptual loss between the CVD-simulated recolored
@@ -145,20 +155,54 @@ class PriorityWeightedLoss(nn.Module):
         weight = 1.0 - priority                                        # low pri -> high weight
         return (weight * l1).mean()
 
+    def contrast_term(self, recolored, priority):
+        """CVD-contrast term (the real 'distinguishability' driver).
+
+        Goal: through CVD eyes, a high-priority region (e.g. a traffic light)
+        should stand out from its local surroundings. We measure, on the
+        CVD-SIMULATED recolored image, the color distance between each pixel and
+        a blurred version of itself (a cheap proxy for 'the local surrounding
+        color'). We then REWARD large distance in high-priority regions, so the
+        loss is the NEGATIVE of the priority-weighted local contrast.
+
+        Because this term is maximized (negated in the loss), the model is
+        actively pushed to make critical regions pop after the colorblind
+        goggle — which the perceptual term alone does not do.
+        """
+        cvd_recolored = self.cvd_sim(recolored)
+        rec01 = _to01(cvd_recolored, self.in01)
+
+        # Local mean color via average-pool blur (separable, differentiable).
+        k = self.contrast_blur_kernel
+        pad = k // 2
+        local_mean = F.avg_pool2d(rec01, kernel_size=k, stride=1, padding=pad,
+                                  count_include_pad=False)
+        # Per-pixel color distance to local surroundings (CVD space).
+        local_contrast = (rec01 - local_mean).pow(2).mean(dim=1, keepdim=True)  # [B,1,H,W]
+
+        # Reward contrast where priority is high -> loss is the negative.
+        # Normalize by priority mass so it does not collapse to 0 on empty maps.
+        pri_mass = priority.mean().clamp(min=1e-4)
+        reward = (priority * local_contrast).mean() / pri_mass
+        return -reward
+
     def forward(self, recolored, original, priority, adv_loss=None):
         distinct = self.distinguishability_term(recolored, original, priority)
         natural = self.naturalness_term(recolored, original, priority)
+        contrast = self.contrast_term(recolored, priority)
 
         adv = adv_loss if adv_loss is not None else torch.zeros((), device=recolored.device)
 
         total = (self.lambda_distinct * distinct
                  + self.lambda_natural * natural
+                 + self.lambda_contrast * contrast
                  + self.lambda_adv * adv)
 
         parts = {
             "total": float(total.detach()),
             "distinct": float(distinct.detach()),
             "natural": float(natural.detach()),
+            "contrast": float(contrast.detach()),
             "adv": float(adv.detach()) if torch.is_tensor(adv) else float(adv),
         }
         return total, parts
