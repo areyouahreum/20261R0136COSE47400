@@ -170,9 +170,20 @@ class MobileNetV3Embedding(nn.Module):
         # We expose the actual pooled dim so the bottleneck adapts automatically.
         self.pooled_dim = 960
         self.logit_dim = 1000
+        self._frozen = freeze
         if freeze:
             for p in self.parameters():
                 p.requires_grad = False
+            self.eval()   # lock Dropout/BN now
+
+    def train(self, mode=True):
+        # When frozen, never leave eval mode: the classifier head contains
+        # Dropout, and the backbone has BatchNorm. If MAUNet.train() propagated
+        # into this submodule, the embedding would become stochastic / its BN
+        # stats would drift, making the injected context noisy across steps.
+        if getattr(self, "_frozen", False):
+            return super().train(False)
+        return super().train(mode)
 
     @torch.no_grad()
     def forward(self, rgb):
