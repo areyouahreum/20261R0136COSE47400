@@ -1,0 +1,91 @@
+"""
+Priority-Map Post-Processing — Speckle Removal
+==============================================
+
+The Stage 1 U-Net often produces a *scattered / noisy* priority map: besides the
+real high-priority blob (a traffic light, a sign), there are many isolated
+high-value pixels sprinkled across the background. When that noisy map is fed to
+the Stage 2 MAU-Net, the recolorer has no clean region to focus on, so it tends
+to apply a dull, global change instead of a crisp local one (the "washed out"
+look in the sample grids).
+
+This module cleans the priority map with a cheap, fully-tensor (GPU-friendly,
+differentiable-safe) morphological opening followed by a light blur:
+
+    opening = erosion (min-pool) then dilation (max-pool)
+        -> removes small bright speckles while preserving large bright regions
+    light blur (avg-pool)
+        -> smooths the edges so the MAU-Net sees soft, contiguous priority
+
+Use it right after the frozen U-Net, before concatenating to the RGB image:
+
+    from priority_postprocess import clean_priority_map
+    with torch.no_grad():
+        priority = unet(imgs)
+        priority = clean_priority_map(priority)     # <-- new line
+    conditioned = torch.cat([imgs, priority], dim=1)
+
+It is a no-op-friendly transform: a perfectly clean map passes through almost
+unchanged, so adding it never hurts and usually helps on noisy maps.
+"""
+
+import torch
+import torch.nn.functional as F
+
+
+def clean_priority_map(priority, open_iters=1, open_kernel=3, blur_kernel=3):
+    """Denoise a priority map.
+
+    Args:
+        priority:    [B,1,H,W] tensor in [0,1] (U-Net sigmoid output).
+        open_iters:  how many erosion->dilation (opening) passes. 1 is usually
+                     enough; 2 removes more speckle but can shrink thin signals.
+        open_kernel: spatial size of the opening (odd int).
+        blur_kernel: spatial size of the final smoothing blur (odd int; 1 = off).
+
+    Returns:
+        [B,1,H,W] cleaned priority map in [0,1].
+
+    Notes:
+        * Erosion is implemented as min-pool = -max_pool(-x).
+        * This preserves large high-priority blobs (traffic lights/signs) while
+          deleting isolated high pixels scattered over the background.
+    """
+    if priority.dim() != 4 or priority.shape[1] != 1:
+        raise ValueError(f"Expected [B,1,H,W], got {tuple(priority.shape)}")
+
+    p = priority.clamp(0.0, 1.0)
+    pad = open_kernel // 2
+
+    # Morphological opening: erosion (min-pool) then dilation (max-pool).
+    for _ in range(open_iters):
+        eroded = -F.max_pool2d(-p, kernel_size=open_kernel, stride=1, padding=pad)
+        p = F.max_pool2d(eroded, kernel_size=open_kernel, stride=1, padding=pad)
+
+    # Light smoothing so the MAU-Net sees soft, contiguous regions.
+    if blur_kernel and blur_kernel > 1:
+        bpad = blur_kernel // 2
+        p = F.avg_pool2d(p, kernel_size=blur_kernel, stride=1, padding=bpad,
+                         count_include_pad=False)
+
+    return p.clamp(0.0, 1.0)
+
+
+if __name__ == "__main__":
+    # Sanity check: a real blob survives, scattered speckle is removed.
+    torch.manual_seed(0)
+    H = W = 64
+    pri = torch.zeros(1, 1, H, W)
+    pri[:, :, 26:38, 26:38] = 1.0                       # real signal blob
+    speckle = (torch.rand(1, 1, H, W) > 0.85).float() * 0.9
+    noisy = (pri + speckle).clamp(0, 1)
+
+    cleaned = clean_priority_map(noisy)
+
+    print(f"noisy high pixels (>0.5): {int((noisy > 0.5).sum())}")
+    print(f"clean high pixels (>0.5): {int((cleaned > 0.5).sum())}")
+    print(f"blob center preserved   : {float(cleaned[0,0,32,32]):.2f}  (want ~1.0)")
+    print(f"background speckle gone  : {float(cleaned[0,0,2,2]):.2f}  (want ~0.0)")
+    assert cleaned[0, 0, 32, 32] > 0.8, "real signal should survive"
+    assert int((cleaned > 0.5).sum()) < int((noisy > 0.5).sum()), "speckle should drop"
+    print("\nclean_priority_map OK.")
