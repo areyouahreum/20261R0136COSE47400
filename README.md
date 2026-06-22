@@ -100,8 +100,14 @@ The priority map acts as a spatial guide that tells the MAU-Net which regions sh
 
 During training, the Stage 1 U-Net remains frozen, and only the MAU-Net corrector is updated. The recolored output is passed through a CVD simulation before loss computation, allowing the model to learn based on how the image would appear to a CVD viewer. The planned training objective combines L1 loss and perceptual loss after CVD simulation, encouraging the recolored image to remain visually natural for normal-vision users while improving distinguishability for CVD users.
 
-This stage aims to avoid global recoloring and instead perform semantic-aware recoloring, where only important safety-related objects are emphasized strongly.
+The MAU-Net corrector was trained for 10 epochs using the priority map from Stage 1 as an additional input channel. During training, the generator loss decreased from 0.3468 to 0.2006, while the distinctiveness loss also decreased from 0.1255 to 0.0590. This shows that the model learned to apply more targeted recoloring while keeping the output visually natural.
 
+| Epoch | Generator Loss | Discriminator Loss | Distinctiveness Loss | Naturalness Loss | Adversarial Loss |
+|---|---:|---:|---:|---:|---:|
+| 1 | 0.3468 | 0.6623 | 0.1255 | 0.0548 | 0.7646 |
+| 10 | 0.2006 | 0.6743 | 0.0590 | 0.0364 | 0.7397 |
+
+This stage aims to avoid global recoloring and instead perform semantic-aware recoloring, where only important safety-related objects are emphasized strongly.
 ---
 
 ## References
